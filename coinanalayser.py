@@ -7,265 +7,152 @@ from dateutil.relativedelta import relativedelta
 import yfinance as yf
 import warnings
 import configparser
-from typing import Optional, Dict
+from typing import Optional
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
 def load_config() -> configparser.ConfigParser:
-    """Config dosyasını yükler"""
     config = configparser.ConfigParser()
     config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
-
     if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found at: {config_path}")
-
+        raise FileNotFoundError(f"Config dosyasi bulunamadi: {config_path}")
     config.read(config_path)
     return config
 
 
-def fetch_binance_price(symbol: str, start_ms: int, url: str, max_retries: int = 3) -> Optional[float]:
-    """Binance'den fiyat çeker - retry mantığı ile"""
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(
-                url,
-                params={'symbol': symbol, 'interval': '1d', 'limit': 1, 'startTime': start_ms},
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            if data and len(data) > 0:
-                return float(data[0][4])  # close price
-
-        except requests.exceptions.RequestException as e:
-            if attempt == max_retries - 1:
-                print(f"   ⚠ {symbol} çekilemedi: {e}")
-            time.sleep(1)  # Retry öncesi bekle
-
-    return None
+def fetch_binance_price(symbol: str, start_ms: int, url: str) -> Optional[float]:
+    try:
+        response = requests.get(
+            url,
+            params={'symbol': symbol, 'interval': '1d', 'limit': 1, 'startTime': start_ms},
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+        return float(data[0][4]) if data else None
+    except Exception:
+        return None
 
 
 def fetch_usdtry_price(target_date: datetime.datetime) -> Optional[float]:
-    """Yahoo Finance'den USDTRY kurunu çeker"""
     try:
         yf_df = yf.download(
             "USDTRY=X",
-            start=(target_date - datetime.timedelta(days=4)).strftime('%Y-%m-%d'),
+            start=(target_date - datetime.timedelta(days=5)).strftime('%Y-%m-%d'),
             end=(target_date + datetime.timedelta(days=1)).strftime('%Y-%m-%d'),
-            progress=False,
-            auto_adjust=True
+            progress=False, auto_adjust=True
         )
-
-        if not yf_df.empty:
-            last_close = yf_df['Close'].iloc[-1]
-            return float(last_close)
-
-    except Exception as e:
-        print(f"   ⚠ USDTRY çekilemedi: {e}")
-
-    return None
+        return float(yf_df['Close'].iloc[-1]) if not yf_df.empty else None
+    except Exception:
+        return None
 
 
-def calculate_investment_metrics(df: pd.DataFrame, monthly_tl: int) -> pd.DataFrame:
-    """Yatırım metriklerini hesaplar"""
+def calculate_investment_metrics(df: pd.DataFrame, per_transaction_tl: int) -> pd.DataFrame:
+    df[['USDTRY', 'BTCUSDT', 'ETHUSDT']] = df[['USDTRY', 'BTCUSDT', 'ETHUSDT']].ffill()
 
-    # Aylık alım miktarları
-    df['Alinan_Dolar'] = monthly_tl / df['USDTRY']
+    df['Alinan_Dolar'] = per_transaction_tl / df['USDTRY']
     df['Alinan_BTC'] = df['Alinan_Dolar'] / df['BTCUSDT']
-    df['Toplam_BTC'] = df['Alinan_BTC'].cumsum()
-
     df['Alinan_ETH'] = df['Alinan_Dolar'] / df['ETHUSDT']
+
+    df['Toplam_BTC'] = df['Alinan_BTC'].cumsum()
     df['Toplam_ETH'] = df['Alinan_ETH'].cumsum()
-
     df['Toplam_Dolar'] = df['Alinan_Dolar'].cumsum()
-    df['Toplam_Yatirilan_TRY'] = monthly_tl * (df.index + 1)
+    df['Toplam_Yatirilan_TRY'] = per_transaction_tl * (df.index + 1)
 
-    # Güncel değerler (son satırdaki fiyatları kullan)
-    son_btc = df['BTCUSDT'].iloc[-1]
-    son_eth = df['ETHUSDT'].iloc[-1]
-    son_kur = df['USDTRY'].iloc[-1]
+    last_btc, last_eth, last_kur = df['BTCUSDT'].iloc[-1], df['ETHUSDT'].iloc[-1], df['USDTRY'].iloc[-1]
 
-    # USD bazlı güncel değerler
-    df['BTC_Guncel_Deger_USD'] = df['Toplam_BTC'] * son_btc
-    df['ETH_Guncel_Deger_USD'] = df['Toplam_ETH'] * son_eth
-    df['Dolar_Guncel_Deger_USD'] = df['Toplam_Dolar']
+    df['BTC_Deger_TRY'] = df['Toplam_BTC'] * last_btc * last_kur
+    df['ETH_Deger_TRY'] = df['Toplam_ETH'] * last_eth * last_kur
+    df['USD_Deger_TRY'] = df['Toplam_Dolar'] * last_kur
 
-    # TRY bazlı güncel değerler
-    df['BTC_Guncel_Deger_TRY'] = df['BTC_Guncel_Deger_USD'] * son_kur
-    df['ETH_Guncel_Deger_TRY'] = df['ETH_Guncel_Deger_USD'] * son_kur
-    df['Dolar_Guncel_Deger_TRY'] = df['Dolar_Guncel_Deger_USD'] * son_kur
-
-    # Kar/Zarar hesaplamaları
-    df['BTC_Kar_Zarar_TRY'] = df['BTC_Guncel_Deger_TRY'] - df['Toplam_Yatirilan_TRY']
-    df['BTC_Kar_Zarar_Yuzde'] = (df['BTC_Kar_Zarar_TRY'] / df['Toplam_Yatirilan_TRY']) * 100
-
-    df['ETH_Kar_Zarar_TRY'] = df['ETH_Guncel_Deger_TRY'] - df['Toplam_Yatirilan_TRY']
-    df['ETH_Kar_Zarar_Yuzde'] = (df['ETH_Kar_Zarar_TRY'] / df['Toplam_Yatirilan_TRY']) * 100
-
-    df['Dolar_Kar_Zarar_TRY'] = df['Dolar_Guncel_Deger_TRY'] - df['Toplam_Yatirilan_TRY']
-    df['Dolar_Kar_Zarar_Yuzde'] = (df['Dolar_Kar_Zarar_TRY'] / df['Toplam_Yatirilan_TRY']) * 100
+    df['BTC_ROI_%'] = ((df['BTC_Deger_TRY'] - df['Toplam_Yatirilan_TRY']) / df['Toplam_Yatirilan_TRY']) * 100
+    df['ETH_ROI_%'] = ((df['ETH_Deger_TRY'] - df['Toplam_Yatirilan_TRY']) / df['Toplam_Yatirilan_TRY']) * 100
+    df['USD_ROI_%'] = ((df['USD_Deger_TRY'] - df['Toplam_Yatirilan_TRY']) / df['Toplam_Yatirilan_TRY']) * 100
 
     return df
 
 
-def save_to_excel(df: pd.DataFrame, directory: str) -> str:
-    """DataFrame'i formatlanmış Excel'e kaydeder"""
-    timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    filename = f"combined_crypto_data_{timestamp}.xlsx"
-    file_path = os.path.join(directory, filename)
-
-    with pd.ExcelWriter(file_path, engine='xlsxwriter') as writer:
-        # Ana veri sayfası
+def save_to_excel(df: pd.DataFrame, directory: str):
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = os.path.join(directory, f"Yatirim_Analizi_{timestamp}.xlsx")
+    with pd.ExcelWriter(path, engine='xlsxwriter') as writer:
         df.to_excel(writer, sheet_name='Detayli_Veri', index=False)
-
         workbook = writer.book
         worksheet = writer.sheets['Detayli_Veri']
-
-        # Format tanımlamaları
-        money_fmt = workbook.add_format({'num_format': '#,##0.00', 'align': 'right'})
-        percent_fmt = workbook.add_format({'num_format': '0.00%', 'align': 'right'})
-        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D7E4BD', 'border': 1})
-
-        # Kolon genişlikleri
-        worksheet.set_column('A:A', 12)  # Tarih
-        worksheet.set_column('B:Z', 16, money_fmt)  # Tüm sayılar
-
-        # Header formatı
+        num_fmt = workbook.add_format({'num_format': '#,##0.00'})
+        pct_fmt = workbook.add_format({'num_format': '0.0"%"'})
+        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#CFE2F3', 'border': 1})
         for col_num, value in enumerate(df.columns.values):
             worksheet.write(0, col_num, value, header_fmt)
-
-        # Özet sayfa oluştur
-        create_summary_sheet(writer, df, workbook)
-
-    return file_path
-
-
-def create_summary_sheet(writer, df: pd.DataFrame, workbook):
-    """Özet sayfa oluşturur"""
-    summary_data = {
-        'Yatırım Türü': ['Bitcoin (BTC)', 'Ethereum (ETH)', 'Dolar (USD)'],
-        'Toplam Yatırılan (TRY)': [df['Toplam_Yatirilan_TRY'].iloc[-1]] * 3,
-        'Güncel Değer (TRY)': [
-            df['BTC_Guncel_Deger_TRY'].iloc[-1],
-            df['ETH_Guncel_Deger_TRY'].iloc[-1],
-            df['Dolar_Guncel_Deger_TRY'].iloc[-1]
-        ],
-        'Kar/Zarar (TRY)': [
-            df['BTC_Kar_Zarar_TRY'].iloc[-1],
-            df['ETH_Kar_Zarar_TRY'].iloc[-1],
-            df['Dolar_Kar_Zarar_TRY'].iloc[-1]
-        ],
-        'Kar/Zarar (%)': [
-            df['BTC_Kar_Zarar_Yuzde'].iloc[-1] / 100,
-            df['ETH_Kar_Zarar_Yuzde'].iloc[-1] / 100,
-            df['Dolar_Kar_Zarar_Yuzde'].iloc[-1] / 100
-        ]
-    }
-
-    summary_df = pd.DataFrame(summary_data)
-    summary_df.to_excel(writer, sheet_name='Ozet', index=False)
-
-    # Özet sayfası formatları
-    worksheet = writer.sheets['Ozet']
-    money_fmt = workbook.add_format({'num_format': '#,##0.00 ₺'})
-    percent_fmt = workbook.add_format({'num_format': '0.00%'})
-
-    worksheet.set_column('A:A', 20)
-    worksheet.set_column('B:D', 20, money_fmt)
-    worksheet.set_column('E:E', 15, percent_fmt)
+            if '%' in value:
+                worksheet.set_column(col_num, col_num, 12, pct_fmt)
+            else:
+                worksheet.set_column(col_num, col_num, 15, num_fmt)
+    return path
 
 
-def fetch_all_monthly_26th_data():
-    """Ana fonksiyon - tüm veriyi çeker ve işler"""
+def run_analysis():
     try:
-        # Config yükle
         config = load_config()
-        directory = config.get('PATHS', 'base_directory')
-        years_back = config.getint('SETTINGS', 'years_back')
-        monthly_tl = config.getint('SETTINGS', 'monthly_income_tl')
-        binance_url = config.get('API', 'binance_url')
+        mode = config.get('SETTINGS', 'mode', fallback='fixed_day')
+        inv_day = config.getint('SETTINGS', 'investment_day', fallback=26)
+        inv_interval = config.getint('SETTINGS', 'interval_days', fallback=30)
+        years = config.getint('SETTINGS', 'years_back')
+        amount = config.getint('SETTINGS', 'monthly_income_tl')
+        base_dir = config.get('PATHS', 'base_directory')
+        api_url = config.get('API', 'binance_url')
 
-        os.makedirs(directory, exist_ok=True)
+        os.makedirs(base_dir, exist_ok=True)
+        end_date = datetime.datetime.now()
 
-        # Tarih aralığı
-        today = datetime.datetime.now()
-        start_date = today - relativedelta(years=years_back)
-        current_month = start_date
+        # Başlangıç tarihini ayarla ve istenen güne sabitle
+        current_date = (end_date - relativedelta(years=years))
+        if mode == 'fixed_day':
+            try:
+                current_date = current_date.replace(day=inv_day)
+            except ValueError:
+                # Eğer o ay o gün yoksa (31 Şubat vb), ayın son günü yap
+                current_date = (current_date + relativedelta(months=1)).replace(day=1) - datetime.timedelta(days=1)
+
         rows = []
+        print(f"📊 Analiz Modu: {mode} | Baslangic: {current_date.date()}")
 
-        print(f"\n{'=' * 60}")
-        print(f"📊 Kripto Analiz Başlıyor")
-        print(f"{'=' * 60}")
-        print(f"Dönem: {start_date.date()} → {today.date()}")
-        print(f"Aylık Yatırım: {monthly_tl:,} TL")
-        print(f"Kayıt Yeri: {directory}\n")
-
-        # Her ayın 26'sı için veri çek
-        while current_month <= today:
-            target_date = datetime.datetime(current_month.year, current_month.month, 26)
-            if target_date > today:
-                break
-
-            start_ms = int(target_date.timestamp() * 1000)
-
-            print(f"⏳ {target_date.strftime('%Y-%m-%d')} işleniyor...")
-
-            # Fiyatları çek
-            btc_price = fetch_binance_price('BTCUSDT', start_ms, binance_url)
-            eth_price = fetch_binance_price('ETHUSDT', start_ms, binance_url)
-            usd_try = fetch_usdtry_price(target_date)
+        while current_date <= end_date:
+            ts = int(current_date.timestamp() * 1000)
+            btc = fetch_binance_price('BTCUSDT', ts, api_url)
+            eth = fetch_binance_price('ETHUSDT', ts, api_url)
+            usd = fetch_usdtry_price(current_date)
 
             rows.append({
-                'Tarih': target_date.strftime('%Y-%m-%d'),
-                'BTCUSDT': btc_price,
-                'ETHUSDT': eth_price,
-                'USDTRY': usd_try
+                'Tarih': current_date.strftime('%Y-%m-%d'),
+                'BTCUSDT': btc, 'ETHUSDT': eth, 'USDTRY': usd
             })
 
-            print(f"   ✓ BTC: ${btc_price:,.2f} | ETH: ${eth_price:,.2f} | Kur: ₺{usd_try:.2f}")
+            print(f"✅ {current_date.strftime('%Y-%m-%d')} islendi.")
 
-            current_month += relativedelta(months=1)
-            time.sleep(0.3)  # Rate limiting
+            # --- TARİH İLERLETME MANTIĞI ---
+            if mode == 'fixed_day':
+                # Bir sonraki aya geç ve günü koru
+                current_date += relativedelta(months=1)
+                try:
+                    current_date = current_date.replace(day=inv_day)
+                except ValueError:
+                    # Ay sonu kontrolü
+                    current_date = (current_date + relativedelta(months=1)).replace(day=1) - datetime.timedelta(days=1)
+            else:
+                # Sadece belirlenen gün kadar ekle
+                current_date += datetime.timedelta(days=inv_interval)
 
-        # DataFrame oluştur
-        df = pd.DataFrame(rows)
+            time.sleep(0.1)
 
-        # Eksik veri kontrolü
-        missing_data = df.isnull().sum()
-        if missing_data.any():
-            print(f"\n⚠ Eksik veriler var:\n{missing_data[missing_data > 0]}")
+        df = calculate_investment_metrics(pd.DataFrame(rows), amount)
+        file_path = save_to_excel(df, base_dir)
+        print(f"\n🚀 Islem tamamlandi!\nDosya: {file_path}")
 
-        # Metrikleri hesapla
-        df = calculate_investment_metrics(df, monthly_tl)
-
-        # Excel'e kaydet
-        file_path = save_to_excel(df, directory)
-
-        # Sonuç özeti
-        print(f"\n{'=' * 60}")
-        print(f"✅ BAŞARILI!")
-        print(f"{'=' * 60}")
-        print(f"📁 Dosya: {file_path}")
-        print(f"📊 Toplam Veri: {len(df)} ay")
-        print(f"\n💰 SON DURUM:")
-        print(f"   Toplam Yatırılan: {df['Toplam_Yatirilan_TRY'].iloc[-1]:,.2f} TL")
-        print(
-            f"   BTC Değeri: {df['BTC_Guncel_Deger_TRY'].iloc[-1]:,.2f} TL ({df['BTC_Kar_Zarar_Yuzde'].iloc[-1]:+.2f}%)")
-        print(
-            f"   ETH Değeri: {df['ETH_Guncel_Deger_TRY'].iloc[-1]:,.2f} TL ({df['ETH_Kar_Zarar_Yuzde'].iloc[-1]:+.2f}%)")
-        print(
-            f"   Dolar Değeri: {df['Dolar_Guncel_Deger_TRY'].iloc[-1]:,.2f} TL ({df['Dolar_Kar_Zarar_Yuzde'].iloc[-1]:+.2f}%)")
-        print(f"{'=' * 60}\n")
-
-    except FileNotFoundError as e:
-        print(f"❌ Hata: {e}")
     except Exception as e:
-        print(f"❌ Beklenmeyen hata: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Hata: {e}")
 
 
 if __name__ == "__main__":
-    fetch_all_monthly_26th_data()
+    run_analysis()
